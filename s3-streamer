@@ -1,0 +1,238 @@
+#!/usr/bin/python3
+
+import argparse
+import json
+import mimetypes
+import os
+import textwrap
+import time
+import urllib.parse
+
+from bots.lib import s3
+
+
+class Destination:
+    def has(self, filename):
+        raise NotImplementedError
+
+    def write(self, filename, data):
+        raise NotImplementedError
+
+    def delete(self, filenames):
+        raise NotImplementedError
+
+
+class LocalDestination(Destination):
+    def __init__(self, directory):
+        self.directory = directory
+
+    def path(self, filename):
+        return os.path.join(self.directory, filename)
+
+    def has(self, filename):
+        return os.path.exists(self.path(filename))
+
+    def write(self, filename, data):
+        print(f'Write {self.path(filename)}')
+        with open(self.path(filename), 'wb+') as file:
+            file.write(data)
+
+    def delete(self, filenames):
+        for filename in filenames:
+            print(f'Delete {self.path(filename)}')
+            os.unlink(self.path(filename))
+
+
+class S3Destination(Destination):
+    def __init__(self, directory):
+        self.directory = directory.rstrip('/') + '/'
+
+    def url(self, filename):
+        return urllib.parse.urlparse(self.directory + filename)
+
+    def has(self, filename):
+        raise NotImplementedError('use Index')
+
+    def write(self, filename, data):
+        headers = {
+            'Content-Type': mimetypes.guess_type(filename)[0] or 'text/plain',
+            s3.ACL: s3.PUBLIC
+        }
+        with s3.urlopen(self.url(filename), data=data, method='PUT', headers=headers) as response:
+            print(response.status, filename)
+
+    def delete(self, filenames):
+        # to do: multi-object delete API
+        for filename in filenames:
+            with s3.urlopen(self.url(filename), method='DELETE') as response:
+                print(response)
+
+
+class Index(Destination):
+    def __init__(self, destination, filename='index.html'):
+        self.destination = destination
+        self.filename = filename
+        self.files = set()
+        self.dirty = True
+
+    def has(self, filename):
+        return filename in self.files
+
+    def write(self, filename, data):
+        self.destination.write(filename, data)
+        self.files.add(filename)
+        self.dirty = True
+
+    def delete(self, filenames):
+        self.destination.delete(self.destination, filenames)
+        self.files.difference_update(filenames)
+        self.dirty = True
+
+    def sync(self):
+        if self.dirty:
+            self.destination.write(self.filename, textwrap.dedent('''
+                <html>
+                  <body>
+                    <h1>Directory listing for /</h1>
+                    <hr>
+                    <ul>''' + ''.join(f'''
+                      <li><a href={f}>{f}</a></li> ''' for f in self.files) + '''
+                    </ul>
+                  </body>
+                </html>
+                ''').encode('utf-8'))
+            self.dirty = False
+
+
+class AttachmentsDirectory:
+    def __init__(self, destination, local_directory):
+        self.destination = destination
+        self.path = local_directory
+
+    def scan(self):
+        for entry in os.scandir(self.path):
+            if not self.destination.has(entry.name) and entry.is_file(follow_symlinks=False):
+                with open(entry.path, 'rb') as file:
+                    data = file.read()
+                self.destination.write(entry.name, data)
+
+
+class ChunkedUploader:
+    def __init__(self, destination, filename):
+        self.suffixes = set()
+        self.chunks = []
+        self.destination = destination
+        self.filename = filename
+
+    def append_block(self, block):
+        if block:
+            self.chunks.append([block])
+
+        # 2048 algorithm.
+        #
+        # This can be changed to merge more or less often, or to never merge at
+        # all. The only restriction is that it may only ever update the last
+        # item in the list.
+        while len(self.chunks) > 1 and len(self.chunks[-1]) == len(self.chunks[-2]):
+            last = self.chunks.pop()
+            second_last = self.chunks.pop()
+            self.chunks.append(second_last + last)
+
+        # Now we figure out how to send that last item.
+        # Let's keep the client dumb: it doesn't need to know about blocks: only bytes.
+        chunk_sizes = [sum(len(block) for block in chunk) for chunk in self.chunks]
+
+        if chunk_sizes:
+            last_chunk_start = sum(chunk_sizes[:-1])
+            last_chunk_end = last_chunk_start + chunk_sizes[-1]
+            last_chunk_suffix = f'{last_chunk_start}-{last_chunk_end}'
+            self.destination.write(f'{self.filename}.{last_chunk_suffix}', b''.join(self.chunks[-1]))
+            self.suffixes.add(last_chunk_suffix)
+
+        self.destination.write(f'{self.filename}.chunks', json.dumps(chunk_sizes).encode('ascii'))
+
+    def finish(self, block = b''):
+        self.chunks.append([block])
+        total = b''.join(b''.join(block for block in chunk) for chunk in self.chunks)
+        self.destination.write(self.filename, total)
+        self.destination.write(f'{self.filename}.chunks', b'null')
+
+        self.destination.delete([f'{self.filename}.{suffix}' for suffix in self.suffixes])
+
+
+class FilePoller:
+    SIZE_LIMIT = 1000000  # 1MB
+    TIME_LIMIT = 0        # 0s
+
+    def __init__(self, file):
+        self.first = True
+        self.file = file
+
+    def read(self):
+        return self.file.read()
+
+    def poll(self):
+        if self.first:
+            self.first = False
+            return self.read()
+
+        # We can the file once per second
+        # We return data (if available) once per 30 seconds
+        # We also send data if the amount gets too big (1MB)
+        pending = b''
+        elapsed = 0
+
+        while True:
+            pending += self.read()
+
+            if len(pending) > FilePoller.SIZE_LIMIT:
+                return pending
+
+            if pending and elapsed > FilePoller.TIME_LIMIT:
+                return pending
+
+            time.sleep(1)
+            elapsed += 1
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--s3', help="Write to the given S3 URL")
+    group.add_argument('--directory', help="Write to the named local directory")
+    parser.add_argument('--attachments', action='append', default=[], help="Scan the given directory for attachments")
+    parser.add_argument('log', help="Stream the given log file")
+    args = parser.parse_args()
+
+    if args.s3:
+        destination = S3Destination(args.s3)
+    elif args.directory:
+        destination = LocalDestination(args.directory)
+    else:
+        raise AssertionError
+
+    index = Index(destination)
+    attachments_directories = [AttachmentsDirectory(index, directory) for directory in args.attachments]
+    log_uploader = ChunkedUploader(destination, 'log')
+
+    with open(args.log, 'rb') as log_file:
+        log_poller = FilePoller(log_file)
+
+        # Send the static files to start
+        AttachmentsDirectory(index, 'static').scan()
+
+        while True:
+            # Order is important: read the log, upload attachments, send the log
+            # The idea is that attachments should be present before the log that mentions them
+            block = log_poller.poll()
+
+            for attachments_directory in attachments_directories:
+                attachments_directory.scan()
+
+            log_uploader.append_block(block)
+            index.sync()
+
+
+if __name__ == '__main__':
+    main()

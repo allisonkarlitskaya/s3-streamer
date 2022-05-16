@@ -8,18 +8,21 @@ function set_content(text) {
 
 async function fetch_from(url, offset) {
     for (let attempts = 0; attempts < 10; attempts++) {
-        options = {};
+        const options = {};
 
         if (offset) {
-            options.headers = {range: `bytes=${offset}-`};
+            options.headers = { Range: `bytes=${offset}-` };
         }
 
         try {
             const response = await fetch(url, options);
             if (response.ok) {
-                text = await response.text();
-                text = text.substring(offset);  /* HACK: python http.server doesn't do Range */
-                return text;
+                const text = await response.text();
+                if (offset && response.status != 206) {
+                    return text.substring(offset);
+                } else {
+                    return text;
+                }
             } else {
                 return null;
             }
@@ -37,7 +40,8 @@ async function fetch_from(url, offset) {
 async function fetch_content(filename) {
     let content = '';
 
-    while (chunks = JSON.parse(await fetch_from(`${filename}.chunks`))) {
+    let chunks;
+    while ((chunks = JSON.parse(await fetch_from(`${filename}.chunks`)))) {
         let chunk_start = 0;
 
         for (const chunk_size of chunks) {
@@ -47,7 +51,7 @@ async function fetch_content(filename) {
                 const offset = content.length - chunk_start;
                 content += await fetch_from(`${filename}.${chunk_start}-${chunk_end}`, offset);
                 if (content.length != chunk_end) {
-                    console.log('Oops!  No range support?');
+                    console.log(`Received a chunk with an unexpected size.  Exiting.`);
                     return;
                 }
             }

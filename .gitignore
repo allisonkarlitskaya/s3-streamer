@@ -1,0 +1,7 @@
+# Makefile
+/bots
+
+# README.md
+/attachments/
+/log
+/srv/

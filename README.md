@@ -15,9 +15,7 @@ The approach here uploads an amount of data that's bounded by O(n\*lg n) in
 such a way that the browser never needs to perform more than O(lg n)
 operations.
 
-So far this is just a demo, built to run locally.  There's no S3 support.
-
-There's also at least two annoying bugs:
+There are at least two annoying bugs:
 
  - the client attempts to use the Range option to avoid unnecessarily
    downloading data that it already has, but that's not supported by Python's
@@ -31,13 +29,32 @@ There's also at least two annoying bugs:
 ### Testing the proof of concept locally:
 
 ```
+rm -rf srv attachments log
+make bots
+```
+
+```
+mkdir srv
 python3 -m http.server --directory srv
 ```
 
 ```
-chunk-writer
+touch log
+mkdir attachments
+./s3-streamer --directory srv --attachments attachments log
 ```
 
+To view the log: http://0.0.0.0:8080/log.html
+
 ```
-firefox http://0.0.0.0:8080/log.html
+touch attachments/abc
+echo 'Test result: abc' >> log
 ```
+
+Alternatively, for S3 (with the correct credentials):
+
+```
+./s3-streamer --s3 https://cockpit-logs.us-east-1.linodeobjects.com/ --attachments attachments log
+```
+
+To view the log: https://cockpit-logs.us-east-1.linodeobjects.com/
