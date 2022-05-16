@@ -6,7 +6,6 @@ import json
 import locale
 import mimetypes
 import os
-import select
 import subprocess
 import tempfile
 import textwrap
@@ -30,6 +29,7 @@ class Destination:
 class LocalDestination(Destination):
     def __init__(self, directory):
         self.directory = directory
+        os.makedirs(self.directory)
 
     def path(self, filename):
         return os.path.join(self.directory, filename)
@@ -124,15 +124,21 @@ class AttachmentsDirectory:
 
 class ChunkedUploader:
     SIZE_LIMIT = 1000000  # 1MB
-    TIME_LIMIT = 1        # 1s
+    TIME_LIMIT = 10       # 10s
 
-    def __init__(self, destination, filename):
+    def __init__(self, index, filename, encoding=None):
+        self.input_decoder = codecs.getincrementaldecoder(encoding or locale.getpreferredencoding())()
         self.suffixes = {'chunks'}
         self.chunks = []
-        self.destination = destination
+        self.index = index
+        self.destination = index.destination
         self.filename = filename
         self.pending = b''
         self.send_at = 0  # Send the first write immediately
+
+    def init(self):
+        self.destination.write(f'{self.filename}.chunks', json.dumps([]).encode('ascii'))
+        AttachmentsDirectory(self.index, 'static').scan()
 
     def append_block(self, block):
         self.chunks.append([block])
@@ -160,8 +166,16 @@ class ChunkedUploader:
 
         self.destination.write(f'{self.filename}.chunks', json.dumps(chunk_sizes).encode('ascii'))
 
-    def write(self, data):
-        self.pending += data.encode('utf-8')
+    def write(self, data, final=False):
+        # Transcode the data (if necessary), and ensure that it's complete characters
+        self.pending += self.input_decoder.decode(data, final=final).encode('utf-8')
+
+        if final:
+            everything = b''.join(b''.join(block for block in chunk) for chunk in self.chunks) + self.pending
+            self.index.write(self.filename, everything)
+
+            # If the client ever sees a 404, it knows that the streaming is over.
+            self.destination.delete([f'{self.filename}.{suffix}' for suffix in self.suffixes])
 
         if self.pending:
             now = time.monotonic()
@@ -174,30 +188,6 @@ class ChunkedUploader:
                 self.send_at = None
                 self.pending = b''
 
-    def finish(self, index, data=''):
-        self.chunks.append([self.pending + data.encode('utf-8')])
-        total = b''.join(b''.join(block for block in chunk) for chunk in self.chunks)
-        index.write(self.filename, total)
-
-        # If the client ever sees a 404, it knows that the streaming is over.
-        self.destination.delete([f'{self.filename}.{suffix}' for suffix in self.suffixes])
-
-class StreamReader:
-    def __init__(self, file, encoding=None):
-        self.codec = codecs.getincrementaldecoder(encoding or locale.getpreferredencoding())()
-        self.file = file
-
-    def read(self):
-        eof = False
-        data = b''
-
-        while not eof and select.select([self.file.fileno()], [], [], 0)[0]:
-            read = self.file.read1(100000)
-            if not read:
-                eof = True
-            data += read
-
-        return self.codec.decode(data, final=eof)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -215,42 +205,55 @@ def main():
     else:
         raise AssertionError
 
+    # We want the pipe buffer as big as possible, for two reasons:
+    #   - uploading to S3 might take a while and we don't want the output of
+    #     the test to block in the meantime
+    #   - having a large buffer means that we can do a single read and be sure
+    #     to get all the data.  This is particularly important at exit: we don't
+    #     wait for EOF on the log before exiting.
+    #
+    # This is the default value on Linux, and big enough for our purposes.  It
+    # could theoretically have been lowered via /proc/sys/fs/pipe-max-size, but
+    # then fcntl() will fail and we'll find out about it.
+    max_pipe_size = 1048576
+
     with tempfile.TemporaryDirectory() as tmpdir:
         index = Index(destination)
         attachments_directory = AttachmentsDirectory(index, tmpdir)
-        log_uploader = ChunkedUploader(destination, 'log')
+        log_uploader = ChunkedUploader(index, 'log')
 
         with subprocess.Popen(args.cmd, env=dict(os.environ, TEST_ATTACHMENTS=tmpdir),
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              stdin=subprocess.DEVNULL) as process:
+                              stdin=subprocess.DEVNULL, pipesize=max_pipe_size) as process:
             # We want non-blocking reads so that we can send attachments and
             # flush pending chunked data in case the output stalls.
-            #os.set_blocking(process.stdout.fileno(), False)
+            os.set_blocking(process.stdout.fileno(), False)
 
             # Send the static files to start
-            AttachmentsDirectory(index, 'static').scan()
-            log = StreamReader(process.stdout)
+            log_uploader.init()
 
-            while process.poll() is None:
-                # Order is important: read the log, upload attachments, send the log
-                # The idea is that attachments should be present before the log that mentions them
-                print('reading')
-                data = log.read()
-                print(data)
+            process_exited = False
+            while not process_exited:
+                # Order is important: poll the process, read the log, upload attachments, send the log.
+                #
+                # The idea is that we want to read the log one last time after
+                # the process has exited, and we also want to make sure that
+                # any attachment gets uploaded before its mention in the log
+                # reaches the server.
+
+                time.sleep(1)
+                process_exited = process.poll() is not None
+
+                try:
+                    data = os.read(process.stdout.fileno(), max_pipe_size)
+                except BlockingIOError:
+                    data = b''
 
                 attachments_directory.scan()
 
-                log_uploader.write(data)
+                log_uploader.write(data, final=process_exited)
+
                 index.sync()
-
-                time.sleep(1)
-
-            # One last time...
-            data = log.read()
-            print('final', data.__class__)
-            attachments_directory.scan()
-            log_uploader.finish(index, data)
-            index.sync()
 
 
 if __name__ == '__main__':

@@ -34,7 +34,6 @@ make bots
 ```
 
 ```
-mkdir srv
 python3 -m http.server --directory srv
 ```
 
