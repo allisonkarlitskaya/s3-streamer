@@ -118,15 +118,19 @@ class AttachmentsDirectory:
 
 
 class ChunkedUploader:
+    SIZE_LIMIT = 1000000  # 1MB
+    TIME_LIMIT = 1        # 1s
+
     def __init__(self, destination, filename):
-        self.suffixes = set()
+        self.suffixes = {'chunks'}
         self.chunks = []
         self.destination = destination
         self.filename = filename
+        self.pending = b''
+        self.send_at = 0  # Send the first write immediately
 
     def append_block(self, block):
-        if block:
-            self.chunks.append([block])
+        self.chunks.append([block])
 
         # 2048 algorithm.
         #
@@ -151,48 +155,27 @@ class ChunkedUploader:
 
         self.destination.write(f'{self.filename}.chunks', json.dumps(chunk_sizes).encode('ascii'))
 
-    def finish(self, block = b''):
-        self.chunks.append([block])
+    def write(self, data):
+        self.pending += data
+
+        if self.pending:
+            now = time.monotonic()
+
+            if self.send_at is None:
+                self.send_at = now + ChunkedUploader.TIME_LIMIT
+
+            if now >= self.send_at or len(self.pending) >= ChunkedUploader.SIZE_LIMIT:
+                self.append_block(self.pending)
+                self.send_at = None
+                self.pending = b''
+
+    def finish(self, index, data=b''):
+        self.chunks.append([self.pending + data])
         total = b''.join(b''.join(block for block in chunk) for chunk in self.chunks)
-        self.destination.write(self.filename, total)
-        self.destination.write(f'{self.filename}.chunks', b'null')
+        index.write(self.filename, total)
 
+        # If the client ever sees a 404, it knows that the streaming is over.
         self.destination.delete([f'{self.filename}.{suffix}' for suffix in self.suffixes])
-
-
-class FilePoller:
-    SIZE_LIMIT = 1000000  # 1MB
-    TIME_LIMIT = 0        # 0s
-
-    def __init__(self, file):
-        self.first = True
-        self.file = file
-
-    def read(self):
-        return self.file.read()
-
-    def poll(self):
-        if self.first:
-            self.first = False
-            return self.read()
-
-        # We can the file once per second
-        # We return data (if available) once per 30 seconds
-        # We also send data if the amount gets too big (1MB)
-        pending = b''
-        elapsed = 0
-
-        while True:
-            pending += self.read()
-
-            if len(pending) > FilePoller.SIZE_LIMIT:
-                return pending
-
-            if pending and elapsed > FilePoller.TIME_LIMIT:
-                return pending
-
-            time.sleep(1)
-            elapsed += 1
 
 
 def main():
@@ -217,21 +200,21 @@ def main():
     log_uploader = ChunkedUploader(destination, 'log')
 
     with open(args.log, 'rb') as log_file:
-        log_poller = FilePoller(log_file)
-
         # Send the static files to start
         AttachmentsDirectory(index, 'static').scan()
 
         while True:
             # Order is important: read the log, upload attachments, send the log
             # The idea is that attachments should be present before the log that mentions them
-            block = log_poller.poll()
+            data = log_file.read()
 
             for attachments_directory in attachments_directories:
                 attachments_directory.scan()
 
-            log_uploader.append_block(block)
+            log_uploader.write(data)
             index.sync()
+
+            time.sleep(1)
 
 
 if __name__ == '__main__':
