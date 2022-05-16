@@ -156,7 +156,7 @@ class ChunkedUploader:
         self.destination.write(f'{self.filename}.chunks', json.dumps(chunk_sizes).encode('ascii'))
 
     def write(self, data):
-        self.pending += data
+        self.pending += data.encode('utf-8')
 
         if self.pending:
             now = time.monotonic()
@@ -170,7 +170,7 @@ class ChunkedUploader:
                 self.pending = b''
 
     def finish(self, index, data=b''):
-        self.chunks.append([self.pending + data])
+        self.chunks.append([self.pending + data.encode('utf-8')])
         total = b''.join(b''.join(block for block in chunk) for chunk in self.chunks)
         index.write(self.filename, total)
 
@@ -199,7 +199,7 @@ def main():
     attachments_directories = [AttachmentsDirectory(index, directory) for directory in args.attachments]
     log_uploader = ChunkedUploader(destination, 'log')
 
-    with open(args.log, 'rb') as log_file:
+    with open(args.log, 'r') as log_file:
         # Send the static files to start
         AttachmentsDirectory(index, 'static').scan()
 
