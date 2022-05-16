@@ -1,9 +1,14 @@
 #!/usr/bin/python3
 
 import argparse
+import codecs
 import json
+import locale
 import mimetypes
 import os
+import select
+import subprocess
+import tempfile
 import textwrap
 import time
 import urllib.parse
@@ -169,7 +174,7 @@ class ChunkedUploader:
                 self.send_at = None
                 self.pending = b''
 
-    def finish(self, index, data=b''):
+    def finish(self, index, data=''):
         self.chunks.append([self.pending + data.encode('utf-8')])
         total = b''.join(b''.join(block for block in chunk) for chunk in self.chunks)
         index.write(self.filename, total)
@@ -177,6 +182,22 @@ class ChunkedUploader:
         # If the client ever sees a 404, it knows that the streaming is over.
         self.destination.delete([f'{self.filename}.{suffix}' for suffix in self.suffixes])
 
+class StreamReader:
+    def __init__(self, file, encoding=None):
+        self.codec = codecs.getincrementaldecoder(encoding or locale.getpreferredencoding())()
+        self.file = file
+
+    def read(self):
+        eof = False
+        data = b''
+
+        while not eof and select.select([self.file.fileno()], [], [], 0)[0]:
+            read = self.file.read1(100000)
+            if not read:
+                eof = True
+            data += read
+
+        return self.codec.decode(data, final=eof)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -184,8 +205,7 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--s3', help="Write to the given S3 URL")
     group.add_argument('--directory', help="Write to the named local directory")
-    parser.add_argument('--attachments', action='append', default=[], help="Scan the given directory for attachments")
-    parser.add_argument('log', help="Stream the given log file")
+    parser.add_argument('cmd', nargs='+', help="Command to stream the output of")
     args = parser.parse_args()
 
     if args.s3:
@@ -195,26 +215,42 @@ def main():
     else:
         raise AssertionError
 
-    index = Index(destination)
-    attachments_directories = [AttachmentsDirectory(index, directory) for directory in args.attachments]
-    log_uploader = ChunkedUploader(destination, 'log')
+    with tempfile.TemporaryDirectory() as tmpdir:
+        index = Index(destination)
+        attachments_directory = AttachmentsDirectory(index, tmpdir)
+        log_uploader = ChunkedUploader(destination, 'log')
 
-    with open(args.log, 'r') as log_file:
-        # Send the static files to start
-        AttachmentsDirectory(index, 'static').scan()
+        with subprocess.Popen(args.cmd, env=dict(os.environ, TEST_ATTACHMENTS=tmpdir),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              stdin=subprocess.DEVNULL) as process:
+            # We want non-blocking reads so that we can send attachments and
+            # flush pending chunked data in case the output stalls.
+            #os.set_blocking(process.stdout.fileno(), False)
 
-        while True:
-            # Order is important: read the log, upload attachments, send the log
-            # The idea is that attachments should be present before the log that mentions them
-            data = log_file.read()
+            # Send the static files to start
+            AttachmentsDirectory(index, 'static').scan()
+            log = StreamReader(process.stdout)
 
-            for attachments_directory in attachments_directories:
+            while process.poll() is None:
+                # Order is important: read the log, upload attachments, send the log
+                # The idea is that attachments should be present before the log that mentions them
+                print('reading')
+                data = log.read()
+                print(data)
+
                 attachments_directory.scan()
 
-            log_uploader.write(data)
-            index.sync()
+                log_uploader.write(data)
+                index.sync()
 
-            time.sleep(1)
+                time.sleep(1)
+
+            # One last time...
+            data = log.read()
+            print('final', data.__class__)
+            attachments_directory.scan()
+            log_uploader.finish(index, data)
+            index.sync()
 
 
 if __name__ == '__main__':

@@ -29,7 +29,7 @@ There are at least two annoying bugs:
 ### Testing the proof of concept locally:
 
 ```
-rm -rf srv attachments log
+rm -rf srv
 make bots
 ```
 
@@ -39,15 +39,14 @@ python3 -m http.server --directory srv
 ```
 
 ```
-touch log
-mkdir attachments
-./s3-streamer --directory srv --attachments attachments log
+./s3-streamer --directory srv -- sh -c \
+  'echo Attachments: $TEST_ATTACHMENTS; for i in $(seq 60); do echo $i; sleep 1; done'
 ```
 
 To view the log: http://0.0.0.0:8080/log.html
 
 ```
-touch attachments/abc
+touch [path to attachments]/abc
 echo 'Test result: abc' >> log
 ```
 
