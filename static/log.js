@@ -38,7 +38,11 @@ async function fetch_from(url, offset) {
 }
 
 async function fetch_content(filename) {
+    /* Content is unicode text, but we need to know how many bytes we have in
+     * order to perform chunk calculations.  Track that separately.
+     */
     let content = '';
+    let bytes = 0;
 
     let chunks;
     while ((chunks = JSON.parse(await fetch_from(`${filename}.chunks`)))) {
@@ -47,12 +51,16 @@ async function fetch_content(filename) {
         for (const chunk_size of chunks) {
             const chunk_end = chunk_start + chunk_size;
 
-            if (content.length < chunk_end) {
-                const offset = content.length - chunk_start;
-                content += await fetch_from(`${filename}.${chunk_start}-${chunk_end}`, offset);
-                if (content.length != chunk_end) {
-                    console.log(`Received a chunk with an unexpected size.  Exiting.`);
-                    return;
+            if (bytes < chunk_end) {
+                const offset = bytes - chunk_start;
+                if ((chunk = await fetch_from(`${filename}.${chunk_start}-${chunk_end}`, offset))) {
+                    bytes = chunk_end;
+                    content += chunk;
+                } else {
+                    /* If we got nothing, it means the chunk was deleted on the server.
+                     * That happens when the complete log is available.
+                     */
+                    break;
                 }
             }
 
