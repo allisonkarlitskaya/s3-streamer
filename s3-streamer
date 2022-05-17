@@ -189,19 +189,51 @@ class ChunkedUploader:
                 self.pending = b''
 
 
+class Status:
+    def post(self, state, description):
+        raise NotImplementedError
+
+class GitHubStatus(Status):
+    def __init__(self, repo, revision, context, link):
+        self.github = github.GitHub(repo=repo)
+        self.status = {'context': context, 'target_url': link}
+        self.revision = revision
+
+    def post(self, state, description):
+        self.github.post(f'statuses/{self.revision}', dict(self.status, state=state, description=description))
+
+
+class LocalStatus(Status):
+    def __init__(self, directory):
+        print(f'Writing logs to {directory}')
+
+    def post(self, state, description):
+        print(f'Status [{state}] {description}')
+
 def main():
     parser = argparse.ArgumentParser()
 
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--s3', help="Write to the given S3 URL")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--s3', help="Write to the given S3 URL [default: S3_LOGS_URL]")
     group.add_argument('--directory', help="Write to the named local directory")
+
+    parser.add_argument('--test-name', required=True, help='Test name')
+    parser.add_argument('--repo', default=None, help="The repository in which the tested PR is opened")
+    parser.add_argument('--revision', required=True, help="Revision of the PR head")
+    parser.add_argument('--github-context', required=True, help="The full context as written in github")
+
     parser.add_argument('cmd', nargs='+', help="Command to stream the output of")
     args = parser.parse_args()
 
+    subdir = f'{args.test_name}-{args.revision[:8]}-{args.github_context}'
+    subdir = subdir.replace('@', '-').replace('#', '-').replace('/', '-')
+
     if args.s3:
-        destination = S3Destination(args.s3)
+        destination = S3Destination(urllib.parse.urljoin(args.s3, subdir))
+        status = GitHubStatus(args.repo, args.revision, args.github_context, destination.directory + 'log.html')
     elif args.directory:
-        destination = LocalDestination(args.directory)
+        destination = LocalDestination(os.path.join(args.directory, subdir))
+        status = LocalStatus(destination.directory)
     else:
         raise AssertionError
 
@@ -232,6 +264,9 @@ def main():
             # Send the static files to start
             log_uploader.init()
 
+            # In progress...
+            status.post('pending', github.TESTING)
+
             process_exited = False
             while not process_exited:
                 # Order is important: poll the process, read the log, upload attachments, send the log.
@@ -255,6 +290,10 @@ def main():
 
                 index.sync()
 
+            if process.returncode != 0:
+                status.post('failure', f'Tests failed with code {process.returncode}')
+            else:
+                status.post('success', 'Tests passed')
 
 if __name__ == '__main__':
     main()
